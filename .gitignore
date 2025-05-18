@@ -1,0 +1,36 @@
+# Log files
+logs_qwen_reasoning_distill/
+*.log
+
+# Model files and directories
+hf_models/
+model/
+out_qwen_reasoning_distill/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Python specific
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+*.egg-info/
+dist/
+build/
+
+# IDE specific
+.vscode/
+.idea/
+.cursor/
+
+# Other
+.ipynb_checkpoints/
+
+# Datasets
+dataset/
+
+#vitural environment
+./distillation/
