@@ -29,8 +29,5 @@ build/
 # Other
 .ipynb_checkpoints/
 
-# Datasets
-dataset/
-
 #vitural environment
-./distillation/
+.distillation/
