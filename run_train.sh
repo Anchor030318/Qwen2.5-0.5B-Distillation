@@ -27,9 +27,8 @@ LOCAL_MODEL_FULL_PATH="${LOCAL_MODEL_STORAGE_BASE_DIR}/${HUGGING_FACE_MODEL_ID}"
 EXPECTED_CONFIG_FILE="${LOCAL_MODEL_FULL_PATH}/config.json"
 
 if [ ! -f "${HF_DOWNLOAD_SCRIPT_PATH}" ]; then
-  echo "Error: Hugging Face download script (hfd.sh) not found at ${HF_DOWNLOAD_SCRIPT_PATH}. Cannot proceed with automatic download." >&2
-  echo "Please ensure it exists and is executable, or download the model manually." >&2
-  # Allow to proceed; training script might try to download using HF ID (which could be slow)
+  echo "Error: Hugging Face download script (hfd.sh) not found at ${HF_DOWNLOAD_SCRIPT_PATH}. Cannot proceed." >&2
+  # Allow to proceed if model might be manually placed or handled by python script
 else
   if [ ! -x "${HF_DOWNLOAD_SCRIPT_PATH}" ]; then
     echo "Warning: Download script ${HF_DOWNLOAD_SCRIPT_PATH} is not executable. Attempting with 'bash'..." >&2
@@ -39,31 +38,23 @@ else
     echo "Model config not found at ${EXPECTED_CONFIG_FILE}."
     echo "Attempting to download ${HUGGING_FACE_MODEL_ID} using ${HF_DOWNLOAD_SCRIPT_PATH} to ${LOCAL_MODEL_FULL_PATH}..."
     
-    # Ensure the target directory for the model exists before calling hfd.sh
-    # hfd.sh with --local-dir should handle the final directory creation, 
-    # but let's ensure its parent exists for robustness.
     mkdir -p "${LOCAL_MODEL_FULL_PATH}"
     if [ $? -ne 0 ]; then
         echo "Error: Could not create directory ${LOCAL_MODEL_FULL_PATH}. Please check permissions. Exiting." >&2
         exit 1
     fi
 
-    # Execute the hfd.sh script
-    # Pass the REPO_ID and the --local-dir pointing to the exact final path
     echo "Executing: bash ${HF_DOWNLOAD_SCRIPT_PATH} ${HUGGING_FACE_MODEL_ID} --local-dir ${LOCAL_MODEL_FULL_PATH}"
     bash "${HF_DOWNLOAD_SCRIPT_PATH}" "${HUGGING_FACE_MODEL_ID}" --local-dir "${LOCAL_MODEL_FULL_PATH}"
     
     HFD_EXIT_CODE=$?
     if [ ${HFD_EXIT_CODE} -ne 0 ]; then
       echo "Shell: Hugging Face download script (${HF_DOWNLOAD_SCRIPT_PATH}) failed with exit code ${HFD_EXIT_CODE}. Please check errors above. Exiting." >&2
-      # Consider removing LOCAL_MODEL_FULL_PATH if download failed partway
-      # rm -rf "${LOCAL_MODEL_FULL_PATH}"
       exit 1
     fi
     
-    # Verify again if download was successful by checking the config file
     if [ ! -f "${EXPECTED_CONFIG_FILE}" ]; then
-        echo "Shell: Model download script ran, but ${EXPECTED_CONFIG_FILE} is still missing. Download may have failed internally or hfd.sh usage is incorrect. Exiting." >&2
+        echo "Shell: Model download script ran, but ${EXPECTED_CONFIG_FILE} is still missing. Download may have failed. Exiting." >&2
         exit 1
     fi
     echo "Shell: Model ${HUGGING_FACE_MODEL_ID} downloaded successfully to ${LOCAL_MODEL_FULL_PATH}."
@@ -86,42 +77,60 @@ else
   TRAINING_MODEL_PATH="${HUGGING_FACE_MODEL_ID}"
 fi
 
-DATA_PATH="/gz-data/datasets/OpenMathReasoning/data/" # 训练数据路径
-OUTPUT_DIR="out_qwen_reasoning_distill" # 模型检查点和输出的保存目录 (相对于此脚本位置)
-LOG_DIR="logs_qwen_reasoning_distill"   # 日志文件保存目录 (相对于此脚本位置)
+DATA_PATH="/gz-data/datasets/OpenMathReasoning/data/cot-00000-of-00144.parquet" # 训练数据路径
+OUTPUT_DIR="out_qwen_reasoning_distill_continued" # Changed output dir to avoid overwriting previous run
+LOG_DIR="logs_qwen_reasoning_distill_continued"   # Changed log dir for the continued run
 
 # Training Hyperparameters
-EPOCHS=3
-BATCH_SIZE=4          # 单个 GPU 上的批处理大小
-ACCUMULATION_STEPS=4  # 梯度累积步数 (有效批处理大小 = BATCH_SIZE * ACCUMULATION_STEPS)
-LEARNING_RATE=5e-6
-MAX_SEQ_LEN=8192      # 输入序列的最大长度
+EPOCHS=3 # Total number of epochs desired for the training session.
+         # If resuming, training will start from (last_completed_epoch + 1) up to this number.
+BATCH_SIZE=2          
+ACCUMULATION_STEPS=4  
+LEARNING_RATE=5e-6    # Consider if you want to adjust LR for continued training (e.g., smaller LR)
+MAX_SEQ_LEN=1024      
 GRAD_CLIP=1.0
 
 # Hardware and Precision
-DEVICE="cuda:0"       # 使用的设备 (例如 "cuda:0", "cpu")
-DTYPE="bfloat16"      # 数据类型 ("bfloat16", "float16", or "float32")
+DEVICE="cuda:0"       
+DTYPE="float16"      
 
 # Quantization (set to true or false)
 LOAD_IN_4BIT=false
 LOAD_IN_8BIT=false
 
 # Logging and Saving
-LOG_INTERVAL=10       # 每 N 步记录一次日志
-SAVE_INTERVAL=200     # 每 N 步保存一次检查点 (注意: 脚本也会在每个epoch结束时保存)
-USE_WANDB=false        # 是否使用 Weights & Biases (true/false)
+LOG_INTERVAL=10       
+SAVE_INTERVAL=200     
+USE_WANDB=false        
 WANDB_PROJECT="Qwen-Reasoning-Distill" # WandB 项目名称 (如果 USE_WANDB=true)
 
 # DDP (Distributed Data Parallel) - 对于单GPU训练，保持 DDP=false
 # 如果要使用 DDP，您需要使用 torchrun 或类似工具来启动，并相应地设置 DDP=true
 # 例如: torchrun --standalone --nproc_per_node=NUM_GPUS run_train.sh (并在此脚本中处理DDP参数)
 DDP=false # 当前脚本主要为单GPU设计
+NUM_WORKERS=0 # As per previous debugging, keeping num_workers at 0
 
 # --- Script Execution ---
 
 # 构建 Python 脚本的参数
 CMD_ARGS=""
-CMD_ARGS+=" --model_path ${TRAINING_MODEL_PATH}"
+
+# If RESUME_MODEL_WEIGHTS_FROM is set and exists, pass it to --resume_from_checkpoint
+# The python script's --model_path will be effectively overridden by --resume_from_checkpoint for loading model/tokenizer.
+if [ -n "${RESUME_MODEL_WEIGHTS_FROM}" ] && [ -d "${RESUME_MODEL_WEIGHTS_FROM}" ]; then
+  echo "Attempting to load model/tokenizer from checkpoint: ${RESUME_MODEL_WEIGHTS_FROM}"
+  CMD_ARGS+=" --resume_from_checkpoint ${RESUME_MODEL_WEIGHTS_FROM}"
+  # The python script now uses resume_from_checkpoint as the primary source for model/tokenizer if provided.
+  # We still pass a model_path, which can be the resume path or a base path if resume_from_checkpoint is not set.
+  CMD_ARGS+=" --model_path ${RESUME_MODEL_WEIGHTS_FROM}" 
+elif [ -f "${EXPECTED_CONFIG_FILE}" ]; then
+  echo "Starting new training (or no valid resume path specified), using base model: ${TRAINING_MODEL_PATH}"
+  CMD_ARGS+=" --model_path ${TRAINING_MODEL_PATH}"
+else
+  echo "Warning: Local base model not found at ${EXPECTED_CONFIG_FILE} and no resume path. Falling back to Hugging Face ID for MODEL_PATH: ${HUGGING_FACE_MODEL_ID}" >&2
+  CMD_ARGS+=" --model_path ${HUGGING_FACE_MODEL_ID}"
+fi
+
 CMD_ARGS+=" --data_path ${DATA_PATH}"
 CMD_ARGS+=" --out_dir ${OUTPUT_DIR}"
 CMD_ARGS+=" --log_dir ${LOG_DIR}"
@@ -135,6 +144,7 @@ CMD_ARGS+=" --device ${DEVICE}"
 CMD_ARGS+=" --dtype ${DTYPE}"
 CMD_ARGS+=" --log_interval ${LOG_INTERVAL}"
 CMD_ARGS+=" --save_interval ${SAVE_INTERVAL}"
+CMD_ARGS+=" --num_workers ${NUM_WORKERS}"
 
 if [ "$USE_WANDB" = true ]; then
   CMD_ARGS+=" --use_wandb"
@@ -161,7 +171,7 @@ mkdir -p ${OUTPUT_DIR}
 mkdir -p ${LOG_DIR}
 
 # 执行训练脚本
-echo "Starting training with the following command:"
+echo "Starting/Resuming training with the following command:"
 echo "python trainer/train_qwen_reasoning_distill.py ${CMD_ARGS}"
 echo "--------------------------------------------------"
 

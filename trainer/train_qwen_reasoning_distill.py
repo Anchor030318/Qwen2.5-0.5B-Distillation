@@ -9,6 +9,13 @@ import time
 import math
 import warnings
 import torch
+import sys
+print(f"--- PyTorch Version from script: {torch.__version__} ---")
+print(f"--- CUDA Available from script: {torch.cuda.is_available()} ---")
+if torch.cuda.is_available():
+    print(f"--- CUDA Version from script: {torch.version.cuda} ---")
+    print(f"--- cuDNN Version from script: {torch.backends.cudnn.version()} ---")
+    print(f"--- GPU Name: {torch.cuda.get_device_name(0)} ---")
 import torch.distributed as dist
 from contextlib import nullcontext
 from torch import optim, nn
@@ -36,7 +43,7 @@ def get_lr(current_step, total_steps, lr):
     return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
 
 
-def train_epoch(epoch, wandb, logger):
+def train_epoch(epoch, wandb, logger, optimizer, scaler, model, tokenizer):
     # Get special token IDs for reasoning, to apply higher weight
     start_of_think_ids = tokenizer.encode("<think>", add_special_tokens=False)
     end_of_think_ids = tokenizer.encode("</think>", add_special_tokens=False)
@@ -138,33 +145,33 @@ def train_epoch(epoch, wandb, logger):
                 })
 
         if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
-            save_checkpoint(model, tokenizer, f'qwen_reasoning_epoch{epoch+1}_step{step+1}')
+            step_checkpoint_dir = os.path.join(args.save_dir, f'qwen_reasoning_epoch{epoch+1}_step{step+1}')
+            save_checkpoint(model, tokenizer, optimizer, scaler, epoch, step_checkpoint_dir)
 
 
-def save_checkpoint(model, tokenizer, checkpoint_name):
+def save_checkpoint(model, tokenizer, optimizer, scaler, completed_epoch, save_dir_path):
     model.eval()
-    save_path = f'{args.save_dir}/{checkpoint_name}'
-    os.makedirs(save_path, exist_ok=True)
+    os.makedirs(save_dir_path, exist_ok=True)
     
-    # Save the model state
-    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-        state_dict = model.module.state_dict()
-    else:
-        state_dict = model.state_dict()
+    model_to_save = model.module if isinstance(model, DistributedDataParallel) else model
+    model_to_save.save_pretrained(save_dir_path)
+    tokenizer.save_pretrained(save_dir_path)
     
-    # Save model and tokenizer
-    model.save_pretrained(save_path, state_dict=state_dict)
-    tokenizer.save_pretrained(save_path)
+    training_states = {
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scaler_state_dict': scaler.state_dict(),
+        'completed_epoch': completed_epoch # 0-indexed
+    }
+    torch.save(training_states, os.path.join(save_dir_path, 'training_states.pt'))
     
-    Logger(f"Model saved to {save_path}")
+    Logger(f"Checkpoint (model, tokenizer, optimizer, scaler, epoch) saved to {save_dir_path}", logger)
     model.train()
 
 
-def init_model():
+def init_model(path_to_load_from):
     """Initialize the Qwen model and tokenizer"""
-    logger.info(f"Initializing Qwen2.5 model from: {args.model_path}")
+    logger.info(f"Initializing Qwen model and tokenizer from: {path_to_load_from}")
     
-    # Configure quantization if needed
     if args.load_in_8bit or args.load_in_4bit:
         quantization_config = BitsAndBytesConfig(
             load_in_8bit=args.load_in_8bit,
@@ -175,35 +182,42 @@ def init_model():
     else:
         quantization_config = None
     
-    # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path,
+        path_to_load_from,
         trust_remote_code=True,
         use_fast=False
     )
     
-    # Add special tokens for reasoning
     special_tokens = {"additional_special_tokens": ["<think>", "</think>", "<answer>", "</answer>"]}
-    tokenizer.add_special_tokens(special_tokens)
-    
-    # Load model
+    if tokenizer.eos_token not in special_tokens["additional_special_tokens"] and \
+       tokenizer.bos_token not in special_tokens["additional_special_tokens"] and \
+       tokenizer.pad_token not in special_tokens["additional_special_tokens"] and \
+       tokenizer.unk_token not in special_tokens["additional_special_tokens"]:
+        # Only add if not already present as other special tokens (avoids duplicate warnings if already set)
+        # A more robust check might be needed if tokenizer explicitly handles these as part of vocabulary vs. special map
+        num_added_toks = tokenizer.add_special_tokens(special_tokens)
+        if num_added_toks > 0:
+            logger.info(f"Added {num_added_toks} special tokens: {special_tokens['additional_special_tokens']}")
+
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
+        path_to_load_from,
         device_map="auto" if not ddp else {"": args.device},
         trust_remote_code=True,
         quantization_config=quantization_config,
-        torch_dtype=torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+        torch_dtype=torch.float16 if args.dtype == "float16" else (torch.bfloat16 if args.dtype == "bfloat16" else torch.float32)
     )
     
-    # Resize token embeddings for new special tokens
     model.resize_token_embeddings(len(tokenizer))
     
-    # Count parameters
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
     logger.info(f'Model total parameters: {param_count:.3f} million')
     
     if not args.load_in_8bit and not args.load_in_4bit:
         model = model.to(args.device)
+        # If mixed precision with float16 is used, ensure model parameters are initially FP32.
+        # Autocast will handle the conversion to FP16 for operations.
+        if args.dtype == "float16": 
+            model = model.float()
         
     return model, tokenizer
 
@@ -222,27 +236,28 @@ def init_distributed_mode():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Qwen Reasoning Distillation")
-    parser.add_argument("--out_dir", type=str, default="../out")
+    parser.add_argument("--out_dir", type=str, default="../out_qwen_reasoning_distill")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=5e-6)
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--dtype", type=str, default="bfloat16")
+    parser.add_argument("--dtype", type=str, default="float16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="Qwen-Reasoning-Distillation")
-    parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--ddp", action="store_true")
     parser.add_argument("--accumulation_steps", type=int, default=4)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--log_interval", type=int, default=1)
     parser.add_argument("--save_interval", type=int, default=100)
-    parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--max_seq_len", default=1024, type=int)
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen2.5-0.5B")
     parser.add_argument("--data_path", type=str, default="/gz-data/datasets/OpenMathReasoning/data/")
     parser.add_argument("--load_in_8bit", action="store_true", help="Load model in 8-bit precision")
     parser.add_argument("--load_in_4bit", action="store_true", help="Load model in 4-bit precision")
-    parser.add_argument("--log_dir", type=str, default="../logs")
+    parser.add_argument("--log_dir", type=str, default="../logs_qwen_reasoning_distill")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Path to the checkpoint directory to resume training from (e.g., out_qwen_reasoning_distill/qwen_reasoning_epoch2).")
     
     args = parser.parse_args()
 
@@ -261,7 +276,7 @@ if __name__ == "__main__":
     args.wandb_run_name = f"Qwen2.5-0.5B-Reasoning-Distill-Epochs-{args.epochs}-BS-{args.batch_size}-LR-{args.learning_rate}"
 
     # Set up context for mixed precision training
-    ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type)
+    ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=torch.float16 if args.dtype=="float16" else (torch.bfloat16 if args.dtype=="bfloat16" else torch.float32) )
     
     # Check for distributed training
     ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
@@ -288,8 +303,19 @@ if __name__ == "__main__":
     else:
         wandb = None
 
+    # Determine path for loading initial model/tokenizer
+    path_for_model_tokenizer = args.model_path
+    if args.resume_from_checkpoint:
+        if not os.path.isdir(args.resume_from_checkpoint):
+            logger.error(f"Resume checkpoint path {args.resume_from_checkpoint} not found or not a directory. Exiting.")
+            sys.exit(1)
+        path_for_model_tokenizer = args.resume_from_checkpoint
+        logger.info(f"Resuming. Model and tokenizer will be loaded from: {path_for_model_tokenizer}")
+    else:
+        logger.info(f"Starting new training. Model and tokenizer will be loaded from: {args.model_path}")
+
     # Initialize model and tokenizer
-    model, tokenizer = init_model()
+    model, tokenizer = init_model(path_for_model_tokenizer)
 
     # Setup dataset and dataloader
     logger.info(f"Loading dataset from: {args.data_path}")
@@ -305,13 +331,13 @@ if __name__ == "__main__":
         pin_memory=True,
         drop_last=False,
         shuffle=not ddp,
-        num_workers=args.num_workers,
+        num_workers=0,
         sampler=train_sampler,
         collate_fn=train_ds.prepare_batch
     )
 
     # Setup optimizer and scaler
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'bfloat16' or args.dtype == 'float16'))
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16' or args.dtype == 'bfloat16'))
     
     # Setup optimizer with weight decay
     optimizer = optim.AdamW(
@@ -331,17 +357,54 @@ if __name__ == "__main__":
     iter_per_epoch = len(train_loader)
     logger.info(f"Starting training for {args.epochs} epochs, {iter_per_epoch} iterations per epoch")
     
-    for epoch in range(args.epochs):
+    start_epoch = 0
+    if args.resume_from_checkpoint:
+        training_states_path = os.path.join(args.resume_from_checkpoint, 'training_states.pt')
+        if os.path.isfile(training_states_path):
+            logger.info(f"Loading optimizer, scaler, and epoch states from {training_states_path}")
+            # map_location ensures tensors are loaded to the correct device, esp. if resuming on different GPU setup
+            checkpoint_states = torch.load(training_states_path, map_location=args.device) 
+            
+            try:
+                optimizer.load_state_dict(checkpoint_states['optimizer_state_dict'])
+                logger.info("Loaded optimizer state.")
+            except Exception as e:
+                logger.error(f"Could not load optimizer state: {e}. Optimizer will be reinitialized.")
+            
+            if 'scaler_state_dict' in checkpoint_states and (args.dtype == 'float16' or args.dtype == 'bfloat16'):
+                 try:
+                    scaler.load_state_dict(checkpoint_states['scaler_state_dict'])
+                    logger.info("Loaded scaler state.")
+                 except Exception as e:
+                    logger.warning(f"Could not load scaler state: {e}. Continuing with a new scaler state.")
+            elif (args.dtype == 'float16' or args.dtype == 'bfloat16'):
+                logger.warning("Scaler state not found in checkpoint, but mixed precision is enabled. Initializing new scaler state.")
+            
+            loaded_completed_epoch = checkpoint_states.get('completed_epoch', -1)
+            if loaded_completed_epoch != -1:
+                start_epoch = loaded_completed_epoch + 1
+                logger.info(f"Resuming from epoch {start_epoch} (0-indexed). Last completed epoch: {loaded_completed_epoch}.")
+            else: # Should not happen if 'completed_epoch' key is present and valid
+                logger.warning("Key 'completed_epoch' not found or invalid in checkpoint_states. Defaulting to start_epoch 0.")
+        else:
+            logger.warning(f"Training states file 'training_states.pt' not found in {args.resume_from_checkpoint}. "
+                           "Model weights and tokenizer from checkpoint dir will be used. Starting optimizer, scaler, and epoch from scratch.")
+
+    for epoch in range(start_epoch, args.epochs):
         if train_sampler:
             train_sampler.set_epoch(epoch)
         
-        train_epoch(epoch, wandb, logger)
+        train_epoch(epoch, wandb, logger, optimizer, scaler, model, tokenizer)
         
-        # Save checkpoint at the end of each epoch
         if not ddp or dist.get_rank() == 0:
-            save_checkpoint(model, tokenizer, f'qwen_reasoning_epoch{epoch+1}')
+            epoch_checkpoint_dir = os.path.join(args.save_dir, f'qwen_reasoning_epoch{epoch+1}')
+            save_checkpoint(model, tokenizer, optimizer, scaler, epoch, epoch_checkpoint_dir)
     
-    # Final save
     if not ddp or dist.get_rank() == 0:
-        save_checkpoint(model, tokenizer, 'qwen_reasoning_final')
-        logger.info("Training completed successfully!") 
+        final_checkpoint_dir = os.path.join(args.save_dir, 'qwen_reasoning_final')
+        # For final save, completed_epoch is the last epoch number that ran, which is args.epochs - 1
+        save_checkpoint(model, tokenizer, optimizer, scaler, args.epochs - 1, final_checkpoint_dir)
+        logger.info("Training completed successfully!")
+    
+    if ddp:
+        dist.destroy_process_group() 
