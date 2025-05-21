@@ -99,15 +99,13 @@ def train_epoch(epoch, wandb, logger, optimizer, scaler, model, tokenizer):
             actual_special_markers_in_target = is_special_marker & shift_binary_target_mask.bool()
             weighted_loss_mask[actual_special_markers_in_target] = 10.0 
             
-            # Normalize loss by the sum of effective weights in weighted_loss_mask
-            # or by the number of 0/1 target tokens (shift_binary_target_mask.sum())?
-            # Original script normalized by sum of (0/1 mask that had 10s for special tokens), which is weighted sum.
-            # A more standard way is to normalize by the count of target tokens.
-            # Let's use sum of weights as per apparent original logic. If sum is 0, loss is 0.
-            effective_loss_weights_sum = weighted_loss_mask.sum()
+            # Normalize loss by the number of target tokens.
+            num_target_tokens = shift_binary_target_mask.float().sum() # Count of actual target tokens
 
-            if effective_loss_weights_sum > 0:
-                final_loss = (unweighted_token_loss * weighted_loss_mask).sum() / effective_loss_weights_sum
+            if num_target_tokens > 0:
+                # The sum (unweighted_token_loss * weighted_loss_mask).sum() already correctly computes
+                # the sum of weighted losses, as weighted_loss_mask is 0 for non-target tokens.
+                final_loss = (unweighted_token_loss * weighted_loss_mask).sum() / num_target_tokens
             else:
                 final_loss = torch.tensor(0.0, device=args.device) # Avoid division by zero
             
