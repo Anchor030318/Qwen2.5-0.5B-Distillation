@@ -31,3 +31,11 @@ build/
 
 #vitural environment
 .distillation/
+distill/
+
+huggingface/
+
+# dataset
+training_data/.hfd/
+training_data/data/
+

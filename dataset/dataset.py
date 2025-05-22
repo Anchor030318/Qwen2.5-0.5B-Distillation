@@ -7,6 +7,7 @@ import random
 from Util.utils import setup_logger
 import pyarrow.parquet as pq # Added for Parquet metadata
 import pandas as pd # Ensure pandas is available for loading data in getitem
+import re # Import regex module
 
 class SFTDataset(Dataset):
     """
@@ -16,12 +17,17 @@ class SFTDataset(Dataset):
     Generates a single loss mask for distillation targets.
     """
     
-    def __init__(self, data_path, tokenizer: PreTrainedTokenizer, max_length=1024, shuffle=True, log_dir=None):
+    def __init__(self, data_path, tokenizer: PreTrainedTokenizer, max_length=1024, shuffle=True, log_dir=None, system_prompt=None):
         self.logger = setup_logger("SFTDataset", log_dir=log_dir)
         self.logger.info(f"Initializing SFTDataset with data from {data_path}")
         
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.system_prompt = system_prompt
+        if self.system_prompt:
+            self.logger.info(f"Using system prompt: '{self.system_prompt[:100]}...'") # Log a snippet
+        else:
+            self.logger.info("No system prompt provided.")
         
         self.file_paths = []
         self.num_rows_per_file = []
@@ -32,6 +38,23 @@ class SFTDataset(Dataset):
         # Cache for lazy loading
         self.cache_file_path = None
         self.cache_df = None
+
+        # Attempt to get special token IDs once during init for efficiency and early error detection
+        try:
+            self.think_start_id = self.tokenizer.encode("<think>", add_special_tokens=False)[0]
+            self.think_end_id = self.tokenizer.encode("</think>", add_special_tokens=False)[0]
+            self.logger.info(f"Successfully encoded <think> (ID: {self.think_start_id}) and </think> (ID: {self.think_end_id}).")
+        except IndexError:
+            self.logger.error("CRITICAL: <think> or </think> special tags not tokenizable or yield empty lists upon init. Integrity checks for these tags will effectively be disabled or fail. Ensure they are added to tokenizer.")
+            # Set to values that won't match, or handle this as a fatal error depending on requirements
+            self.think_start_id = -1000 # Unlikely to match actual token IDs
+            self.think_end_id = -1001
+        # No longer primarily using <answer> tags for filtering, but keep if useful for other logic later
+        # try:
+        #     self.answer_start_id = self.tokenizer.encode("<answer>", add_special_tokens=False)[0]
+        #     self.answer_end_id = self.tokenizer.encode("</answer>", add_special_tokens=False)[0]
+        # except IndexError: 
+        #     self.answer_start_id, self.answer_end_id = -1, -1 # Placeholder if not found
 
         if os.path.isdir(data_path):
             self.data_type = "parquet_dir"
@@ -213,58 +236,156 @@ class SFTDataset(Dataset):
         return item_content
 
     def __getitem__(self, idx):
-        item = self._get_item_content(idx) # Get raw data
-        
-        question_str = item.get('problem', '')
-        generated_solution_str = item.get('generated_solution', '') 
+        raw_item = self._get_item_content(idx)
+        question_str = raw_item.get('problem', '')
+        generated_solution_str = raw_item.get('generated_solution', '')
 
-        prompt_text = f"Question: {question_str}\n"
-        full_text = f"{prompt_text}{generated_solution_str}"
+        # Prepend system prompt if available
+        effective_prompt_text = f"Question: {question_str}\n"
+        if self.system_prompt:
+            effective_prompt_text = f"{self.system_prompt}\nQuestion: {question_str}\n" # Ensure newline separation
+
+        full_text = f"{effective_prompt_text}{generated_solution_str}"
 
         tokenized_output = self.tokenizer(
             full_text,
             max_length=self.max_length,
             padding="max_length",
             truncation=True,
-            return_attention_mask=True
+            return_attention_mask=True,
+            return_offsets_mapping=True # Ensure offset mapping is returned
         )
 
         input_ids = torch.tensor(tokenized_output["input_ids"])
         attention_mask = torch.tensor(tokenized_output["attention_mask"])
+        offsets = tokenized_output["offset_mapping"]
         labels = input_ids.clone()
-        loss_mask = torch.zeros_like(input_ids, dtype=torch.long)
         
-        prompt_tokens_for_length_calc = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+        # Determine start of solution part (after prompt and potential BOS token)
+        prompt_tokens_for_length_calc = self.tokenizer.encode(effective_prompt_text, add_special_tokens=False)
         len_prompt_tokens = len(prompt_tokens_for_length_calc)
-
         start_of_targets_idx = 0
         if self.tokenizer.bos_token_id is not None and input_ids.numel() > 0 and input_ids[0] == self.tokenizer.bos_token_id:
             start_of_targets_idx = 1 
         start_of_targets_idx += len_prompt_tokens
 
-        if input_ids.numel() > start_of_targets_idx: # Ensure there are tokens beyond the prompt
+        # ---- Filtering and Mask Creation ----
+        # 1. Check for oxed{...} answer presence in the original string (generated_solution_str)
+        boxed_match = re.search(r"\\boxed{(.*?)}", generated_solution_str, re.DOTALL)
+        if not boxed_match:
+            self.logger.debug(f"Item {idx}: No \\boxed{{...}} found. Skipping.")
+            return None # Skip if no boxed answer
+
+        # Initialize masks
+        loss_mask = torch.zeros_like(input_ids, dtype=torch.long)
+        think_mask_sample = torch.zeros_like(input_ids, dtype=torch.bool)
+        answer_mask_sample = torch.zeros_like(input_ids, dtype=torch.bool)
+
+        # Populate base loss_mask for the target section (solution part)
+        if input_ids.numel() > start_of_targets_idx:
             loss_mask[start_of_targets_idx:] = 1
+        loss_mask = loss_mask * attention_mask # Ensure only non-padding tokens are included
+
+        # 2. <think></think> integrity and mask creation
+        # Search for think tags in the tokenized solution part
+        solution_input_ids = input_ids[start_of_targets_idx:]
+        solution_attention_mask = attention_mask[start_of_targets_idx:]
+        actual_solution_len = (solution_attention_mask != 0).sum().item()
         
-        loss_mask = loss_mask * attention_mask
+        # Find first occurrences relative to the start of input_ids
+        pos_think_start_abs, pos_think_end_abs = -1, -1
+        temp_ids_list = input_ids.tolist() # For easier searching with .index()
+
+        try: 
+            # Search only within the actual non-padded, non-prompt part of input_ids
+            first_think_start_rel = temp_ids_list[start_of_targets_idx : start_of_targets_idx + actual_solution_len].index(self.think_start_id)
+            pos_think_start_abs = start_of_targets_idx + first_think_start_rel
+        except ValueError: pass # think_start_id not found
+
+        if pos_think_start_abs != -1: # If <think> is found
+            try:
+                # Search for </think> *after* <think>
+                first_think_end_rel = temp_ids_list[pos_think_start_abs + 1 : start_of_targets_idx + actual_solution_len].index(self.think_end_id)
+                pos_think_end_abs = pos_think_start_abs + 1 + first_think_end_rel
+            except ValueError: pass # think_end_id not found after think_start_id
+            
+            if pos_think_end_abs == -1: # <think> found but no subsequent </think>
+                self.logger.debug(f"Item {idx}: Incomplete <think> block (start at {pos_think_start_abs}, no end). Skipping.")
+                return None # Skip for incomplete think block
+            
+            # Populate think_mask for tokens between <think> and </think>
+            # Excluding the tags themselves
+            if pos_think_end_abs > pos_think_start_abs + 1: # Ensure there are tokens between tags
+                 for i in range(pos_think_start_abs + 1, pos_think_end_abs):
+                    if attention_mask[i] == 1: # Ensure it's not a padding token somehow
+                        think_mask_sample[i] = True
+        else: # No <think> tag found, check if an orphan </think> exists
+            try:
+                temp_ids_list[start_of_targets_idx : start_of_targets_idx + actual_solution_len].index(self.think_end_id)
+                self.logger.debug(f"Item {idx}: Orphan </think> found without preceding <think>. Skipping.")
+                return None # Skip for orphan </think>
+            except ValueError: pass # No orphan </think>, which is fine if no <think> either
+
+        # 3. Populate answer_mask using offset_mapping for oxed{} content
+        # Boxed match was confirmed earlier. Content is boxed_match.group(1)
+        # Character span of the content *inside* oxed{} within generated_solution_str
+        boxed_content_char_start_in_solution = boxed_match.start(1)
+        boxed_content_char_end_in_solution = boxed_match.end(1)
         
-        return input_ids, labels, loss_mask
+        # Convert to character span within full_text
+        prompt_len_chars = len(effective_prompt_text)
+        target_content_char_start_in_full = prompt_len_chars + boxed_content_char_start_in_solution
+        target_content_char_end_in_full = prompt_len_chars + boxed_content_char_end_in_solution
+
+        for token_idx, (offset_char_start, offset_char_end) in enumerate(offsets):
+            if attention_mask[token_idx] == 0 or offset_char_start is None or offset_char_end is None or offset_char_end == 0: 
+                continue # Skip padding, special tokens with no span, or (0,0) offsets
+            
+            # Check if the token is part of the target solution and its span falls within the boxed content
+            if token_idx >= start_of_targets_idx and \
+               offset_char_start >= target_content_char_start_in_full and \
+               offset_char_end <= target_content_char_end_in_full:
+                answer_mask_sample[token_idx] = True
+        
+        if answer_mask_sample.sum() == 0:
+             self.logger.warning(f"Item {idx}: \\boxed{{...}} found, but no tokens were mapped to answer_mask. Solution: '{generated_solution_str[:200]}...'. Boxed content char span in full text: ({target_content_char_start_in_full}-{target_content_char_end_in_full}). Skipping.")
+             return None # Skip if boxed content is empty or not tokenizable within max_length
+
+        return input_ids, labels, loss_mask, answer_mask_sample, think_mask_sample
         
     def prepare_batch(self, batch):
         """
         Process a batch for training.
         Args:
-            batch: List of tuples (input_ids, labels, loss_mask)
+            batch: List of tuples (input_ids, labels, loss_mask, answer_mask, think_mask) 
+                   OR list may contain None values if items were skipped.
         Returns:
-            Dictionary with batch data
+            Dictionary with batch data, or None if batch becomes empty after filtering.
         """
-        input_ids, labels, loss_masks = zip(*batch)
+        # Filter out None items from the batch
+        valid_batch = [item for item in batch if item is not None]
+
+        if not valid_batch: # If all items in the batch were skipped
+            # self.logger.warning("prepare_batch: All items in the current batch were skipped due to invalid tag structures. Returning None.")
+            # Returning None might require the training loop to handle it. 
+            # A dictionary with empty tensors might be an alternative if the trainer expects a dict.
+            # For simplicity, if the training loop can skip `None` from data_loader, this is fine.
+            # Otherwise, an empty dict would be: 
+            # return {"input_ids": torch.empty(0), "labels": torch.empty(0), ...}
+            return None 
+
+        input_ids, labels, loss_masks, answer_masks, think_masks = zip(*valid_batch)
         
         input_ids_stacked = torch.stack(input_ids)
         labels_stacked = torch.stack(labels)
         loss_mask_stacked = torch.stack(loss_masks)
+        answer_mask_stacked = torch.stack(answer_masks)
+        think_mask_stacked = torch.stack(think_masks)
         
         return {
             "input_ids": input_ids_stacked,
             "labels": labels_stacked,
-            "loss_mask": loss_mask_stacked
+            "loss_mask": loss_mask_stacked,
+            "answer_mask": answer_mask_stacked,
+            "think_mask": think_mask_stacked
         } 

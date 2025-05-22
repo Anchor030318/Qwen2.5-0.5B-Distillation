@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from dataset.dataset import SFTDataset
 from Util.utils import setup_logger
+from trainer.custom_loss_module import calculate_efficiency_loss_reward, calculate_repetition_penalty
 
 warnings.filterwarnings('ignore')
 
@@ -57,11 +58,25 @@ def train_epoch(epoch, wandb, logger, optimizer, scaler, model, tokenizer):
     start_time = time.time()
     model.train()
     
-    for step, batch_data in enumerate(train_loader): # batch_data is a dict
+    for step, batch_data in enumerate(train_loader):
+        if batch_data is None: # Handle skipped batch from DataLoader
+            if not ddp or dist.get_rank() == 0: # Log only on rank 0 for DDP
+                logger.warning(f"Epoch {epoch+1}, Step {step+1}/{iter_per_epoch}: Skipping empty batch (all items filtered out).")
+            continue # Skip to the next step
+
         input_ids = batch_data["input_ids"].to(args.device)
         target_ids = batch_data["labels"].to(args.device) 
         # loss_mask from dataset is the binary mask for target tokens (non-prompt, non-padding)
         binary_target_mask = batch_data["loss_mask"].to(args.device)
+        
+        # CRITICAL: answer_section_mask marks the actual answer tokens within target_ids (e.g., between <answer> and </answer>).
+        # It MUST be provided by your SFTDataset. Shape: [batch_size, seq_len], boolean.
+        # It should be 1 for answer tokens that are part of the target (non-padding), 0 otherwise.
+        answer_section_mask = batch_data.get("answer_mask", torch.zeros_like(target_ids, dtype=torch.bool)).to(args.device)
+        
+        # NEW: think_section_mask marks the thinking process tokens (e.g., between <think> and </think>).
+        # It MUST be provided by your SFTDataset. Shape: [batch_size, seq_len], boolean.
+        think_section_mask = batch_data.get("think_mask", torch.zeros_like(target_ids, dtype=torch.bool)).to(args.device)
         
         # Apply learning rate schedule
         lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch, args.learning_rate)
@@ -76,43 +91,66 @@ def train_epoch(epoch, wandb, logger, optimizer, scaler, model, tokenizer):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = target_ids[..., 1:].contiguous()
             shift_binary_target_mask = binary_target_mask[..., 1:].contiguous()
+            # Shift the answer_section_mask to align with shift_labels and unweighted_token_loss
+            shifted_answer_mask = answer_section_mask[..., 1:].contiguous()
+            # Shift the think_section_mask as well
+            shifted_think_mask = think_section_mask[..., 1:].contiguous()
             
-            # Calculate raw per-token loss
+            # --- 1. Base Distillation Loss (Weighted Cross Entropy) ---
             unweighted_token_loss = loss_fct(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1)
             ).view(shift_labels.size()) # Reshape to [batch_size, seq_len-1]
             
-            # Create weighted_loss_mask based on the binary_target_mask
-            # Start with binary target mask (0 for non-targets, 1 for targets)
-            weighted_loss_mask = shift_binary_target_mask.float() # Ensure it's float for weights
-            
-            # Identify special marker tokens in the shifted labels
+            weighted_loss_mask = shift_binary_target_mask.float() # Start with binary target mask
             is_special_marker = torch.zeros_like(shift_labels, dtype=torch.bool)
             for token_id in all_special_marker_ids:
                 is_special_marker = is_special_marker | (shift_labels == token_id)
             
-            # Apply higher weight to special markers that are also target tokens
-            # The value 10.0 was used in the original script provided in context earlier.
-            # Let's use a configurable arg later if needed, for now, hardcode or use existing.
-            # The original script had a hardcoded 10.0 for special tokens.
             actual_special_markers_in_target = is_special_marker & shift_binary_target_mask.bool()
-            weighted_loss_mask[actual_special_markers_in_target] = 10.0 
+            # Use args.special_token_weight for weighting these tokens
+            weighted_loss_mask[actual_special_markers_in_target] = args.special_token_weight 
             
-            # Normalize loss by the number of target tokens.
-            num_target_tokens = shift_binary_target_mask.float().sum() # Count of actual target tokens
-
+            num_target_tokens = shift_binary_target_mask.float().sum()
             if num_target_tokens > 0:
-                # The sum (unweighted_token_loss * weighted_loss_mask).sum() already correctly computes
-                # the sum of weighted losses, as weighted_loss_mask is 0 for non-target tokens.
-                final_loss = (unweighted_token_loss * weighted_loss_mask).sum() / num_target_tokens
+                base_distill_loss = (unweighted_token_loss * weighted_loss_mask).sum() / num_target_tokens
             else:
-                final_loss = torch.tensor(0.0, device=args.device) # Avoid division by zero
-            
-            # Apply gradient accumulation
-            final_loss = final_loss / args.accumulation_steps
+                base_distill_loss = torch.tensor(0.0, device=args.device)
 
-        scaler.scale(final_loss).backward()
+            # --- 2. Efficiency Loss/Reward (L_eff) ---
+            L_eff = torch.tensor(0.0, device=args.device)
+            if args.eff_loss_weight > 0: # Calculate only if weight is positive
+                L_eff = calculate_efficiency_loss_reward(
+                    unweighted_token_loss_batch=unweighted_token_loss,
+                    shifted_labels_batch=shift_labels,
+                    shifted_answer_mask_batch=shifted_answer_mask,
+                    shift_binary_target_mask_batch=shift_binary_target_mask.bool(), # Ensure boolean
+                    eff_loss_threshold=args.eff_loss_threshold,
+                    eff_reward_coeff=args.eff_reward_coeff,
+                    eff_penalty_coeff=args.eff_penalty_coeff,
+                    device=args.device
+                )
+
+            # --- 3. Repetition Penalty (L_rep) ---
+            L_rep = torch.tensor(0.0, device=args.device)
+            if args.rep_loss_weight > 0: # Calculate only if weight is positive
+                L_rep = calculate_repetition_penalty(
+                    shifted_labels_batch=shift_labels,
+                    shifted_think_mask_batch=shifted_think_mask, # Pass the shifted think mask
+                    shift_binary_target_mask_batch=shift_binary_target_mask.bool(), # Ensure boolean
+                    rep_ngram_n=args.rep_ngram_n,
+                    rep_penalty_coeff=args.rep_penalty_coeff, 
+                    device=args.device
+                )
+            
+            # --- Total Loss ---
+            # Apply weights to the custom loss components
+            final_loss = base_distill_loss + args.eff_loss_weight * L_eff + args.rep_loss_weight * L_rep
+            
+            # Apply gradient accumulation scaling to the final combined loss
+            loss_to_backward = final_loss / args.accumulation_steps
+
+        scaler.scale(loss_to_backward).backward()
 
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
@@ -129,17 +167,23 @@ def train_epoch(epoch, wandb, logger, optimizer, scaler, model, tokenizer):
             
             log_msg = (
                 f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iter_per_epoch}) '
-                f'loss:{final_loss.item() * args.accumulation_steps:.3f} ' # Log the properly scaled loss
-                f'lr:{optimizer.param_groups[-1]["lr"]:.8f} '
-                f'epoch_Time:{estimated_time}min'
+                f'TotalLoss:{final_loss.item():.4f} (Base:{base_distill_loss.item():.4f} Eff:{L_eff.item():.4f} Rep:{L_rep.item():.4f}) '
+                f'LR:{optimizer.param_groups[-1]["lr"]:.8f} GradAccumLoss:{loss_to_backward.item():.4f} '
+                f'EpochTime:{estimated_time}min'
             )
             Logger(log_msg, logger)
 
             if (wandb is not None) and (not ddp or dist.get_rank() == 0):
                 wandb.log({
-                    "loss": final_loss.item() * args.accumulation_steps, # Log the properly scaled loss
-                    "lr": optimizer.param_groups[-1]['lr'],
-                    "epoch_Time": estimated_time
+                    "total_loss": final_loss.item(),
+                    "base_distill_loss": base_distill_loss.item(),
+                    "L_eff (weighted)": args.eff_loss_weight * L_eff.item() if args.eff_loss_weight > 0 else 0,
+                    "L_rep (weighted)": args.rep_loss_weight * L_rep.item() if args.rep_loss_weight > 0 else 0,
+                    "L_eff_raw": L_eff.item(),
+                    "L_rep_raw": L_rep.item(),
+                    "learning_rate": optimizer.param_groups[-1]['lr'],
+                    "epoch_time_minutes": estimated_time,
+                    "loss_for_backward": loss_to_backward.item()
                 })
 
         if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
@@ -257,6 +301,37 @@ if __name__ == "__main__":
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Path to the checkpoint directory to resume training from (e.g., out_qwen_reasoning_distill/qwen_reasoning_epoch2).")
     
+    # --- Parameters for Custom Loss Components ---
+    parser.add_argument("--special_token_weight", type=float, default=10.0, 
+                        help="Weight for special tokens (e.g., <think>, <answer>) in the base distillation loss.")
+    # Efficiency Loss/Reward parameters
+    parser.add_argument("--eff_loss_weight", type=float, default=0.1, 
+                        help="Overall weight for the efficiency loss/reward component in the total loss.")
+    parser.add_argument("--eff_loss_threshold", type=float, default=0.5, 
+                        help="Mean answer token loss threshold used in sigmoid for L_eff to determine 'correctness'.")
+    parser.add_argument("--eff_reward_coeff", type=float, default=0.1, 
+                        help="Coefficient for the reward part of L_eff (applied to 1/length for correct short answers).")
+    parser.add_argument("--eff_penalty_coeff", type=float, default=0.1, 
+                        help="Coefficient for the penalty part of L_eff (applied to length for incorrect long answers).")
+    # Repetition Penalty parameters
+    parser.add_argument("--rep_loss_weight", type=float, default=0.05, 
+                        help="Overall weight for the repetition penalty component in the total loss.")
+    parser.add_argument("--rep_ngram_n", type=int, default=4, 
+                        help="N-gram size for calculating repetition penalty (L_rep).")
+    parser.add_argument("--rep_penalty_coeff", type=float, default=1.0, # Renamed from previous rep_coeff to avoid confusion
+                        help="Internal coefficient for the magnitude of the repetition penalty before applying rep_loss_weight.")
+
+    # --- System Prompt for a priori instructions ---
+    default_system_prompt = (
+        "You are an AI assistant. Your primary task is to solve the given mathematical problem.\n"
+        "First, think step-by-step to break down the problem, outline your reasoning, and perform necessary calculations. "
+        "Enclose your entire thought process within <think> and </think> tags.\n"
+        "After your thought process, clearly state the final answer. The final answer must be enclosed within \\boxed{}. "
+        "For example: <think>This is step 1... This is step 2... Thus the answer is X.</think>The final answer is \\boxed{X}."
+    )
+    parser.add_argument("--system_prompt", type=str, default=default_system_prompt, 
+                        help="The system prompt to prepend to each training example to guide model behavior.")
+
     args = parser.parse_args()
 
     # Setup logger
@@ -317,7 +392,8 @@ if __name__ == "__main__":
 
     # Setup dataset and dataloader
     logger.info(f"Loading dataset from: {args.data_path}")
-    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len, log_dir=args.log_dir)
+    # Pass the system_prompt to SFTDataset
+    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len, log_dir=args.log_dir, system_prompt=args.system_prompt)
     
     # Setup sampler for distributed training
     train_sampler = DistributedSampler(train_ds) if ddp else None
